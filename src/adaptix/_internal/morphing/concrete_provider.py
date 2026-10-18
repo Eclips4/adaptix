@@ -10,6 +10,8 @@ from io import BytesIO
 from typing import Generic, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from adaptix._internal.morphing.native.codegen import compile_native_scalar
+
 from ..common import Dumper, Loader
 from ..feature_requirement import HAS_PY_311, HAS_SELF_TYPE
 from ..provider.essential import CannotProvide, Mediator
@@ -407,10 +409,11 @@ class ScalarProvider(MorphingProvider, Generic[T]):
 
     def provide_loader(self, mediator: Mediator, request: LoaderRequest) -> Loader:
         strict_coercion = mediator.mandatory_provide(StrictCoercionRequest(loc_stack=request.loc_stack))
-        return mediator.cached_call(
+        result = mediator.cached_call(
             self._make_loader,
             strict_coercion=strict_coercion,
         )
+        return compile_native_scalar(mediator, request, result)
 
     def _make_loader(self, *, strict_coercion: bool):
         return self._strict_coercion_loader if strict_coercion else self._lax_coercion_loader
