@@ -9,18 +9,29 @@ def get_program(function):
     description = get_description(function)
     if description is None or hasattr(description, "emit"):
         return description
+    from adaptix._internal.morphing.native.x86_64.base64 import Base64Program  # noqa: PLC0415
+    from adaptix._internal.morphing.native.x86_64.datetime import DateTimeProgram  # noqa: PLC0415
+    from adaptix._internal.morphing.native.x86_64.enum import EnumProgram, can_inline_enum  # noqa: PLC0415
     from adaptix._internal.morphing.native.x86_64.optional import OptionalProgram  # noqa: PLC0415
     from adaptix._internal.morphing.native.x86_64.union import LiteralProgram, UnionDumperProgram  # noqa: PLC0415
+    from adaptix._internal.morphing.native.x86_64.uuid import UUIDProgram  # noqa: PLC0415
 
+    if isinstance(description, descriptions.EnumProgram) and not can_inline_enum(description):
+        return None
     emitters = {
         descriptions.ScalarProgram: ScalarProgram,
         descriptions.DecimalProgram: DecimalProgram,
+        descriptions.Base64Program: Base64Program,
+        descriptions.DateTimeProgram: DateTimeProgram,
+        descriptions.EnumProgram: EnumProgram,
         descriptions.OptionalProgram: OptionalProgram,
         descriptions.LiteralProgram: LiteralProgram,
         descriptions.UnionDumperProgram: UnionDumperProgram,
+        descriptions.UUIDProgram: UUIDProgram,
     }
-    emitter = emitters.get(type(description))
-    return emitter(**vars(description)) if emitter is not None else None
+    emitter = emitters[type(description)]
+    return emitter(**vars(description))
+
 
 
 
