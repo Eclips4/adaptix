@@ -1,10 +1,14 @@
+# ruff: noqa: DTZ001
 
 import ctypes
 import gc
+import random
 import subprocess
 import sys
 import weakref
 from dataclasses import dataclass, make_dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any
 
 import pytest
@@ -137,14 +141,117 @@ else:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("debug_trail", list(DebugTrail))
+def test_iso_datetime_range_fractions_and_fallbacks(debug_trail):
+    randomizer = random.Random(9127)  # noqa: S311
+    values = [datetime(1, 1, 1), datetime(9999, 12, 31, 23, 59, 59, 999999), datetime(2000, 2, 29)]
+    for _ in range(500):
+        year = randomizer.randint(1, 9999)
+        value = datetime(year, randomizer.randint(1, 12), 1)
+        values.append(value + timedelta(
+            days=randomizer.randrange(28), seconds=randomizer.randrange(86400),
+            microseconds=randomizer.randrange(1000000),
+        ))
+    values.extend(datetime(2024, 2, 29, 3, 4, 5, microsecond) for microsecond in (0, 1, 99, 100, 9999, 10000, 100000))
+    values.extend((
+        datetime(2024, 2, 29, tzinfo=timezone.utc),
+        datetime(2024, 2, 29, tzinfo=timezone(timedelta(hours=-3, minutes=-30))),
+        datetime(2024, 2, 29, fold=1),
+    ))
+    python = Retort(debug_trail=debug_trail)
+    native = python.replace(codegen_backend=CodeGenBackend.X86_64)
+    dump = native.get_dumper(list[datetime])
+    text = [value.isoformat() for value in values]
+    assert dump(values) == text
+    loaded = native.get_loader(list[datetime])(text)
+    assert loaded == python.get_loader(list[datetime])(text)
+    assert dump(loaded) == text
+    assert [hash(value) for value in loaded] == [hash(value) for value in values]
+    assert sorted(loaded[:500]) == sorted(values[:500])
+    assert all(value.fold == 0 for value in loaded)
 
 
+@pytest.mark.parametrize("text", [
+    "1900-02-29T03:04:05", "0000-01-01T00:00:00", "2024-02-30T01:02:03",
+    "2024-13-01T00:00:00", "2024-01-00T00:00:00", "2024-01-01T24:00:00",
+    "2024-01-01T00:60:00", "2024-01-01T00:00:60", "2024-01-01T00:00:00.12a456",
+    "2024-01-01T00:00:00.00000/", "2024-01-01T00:00:00.99999:",
+    "2024-01-01T00:00:00.éééééé", "2024-01-01", "20240101T000000", "2024-W01-1T00:00:00",
+    "2024-01-01 00:00:00", "2024-01-01T00:00:00.123", "2024-01-01T00:00:00Z",
+])
+def test_iso_datetime_noncanonical_and_invalid_inputs(text):
+    python = Retort()
+    native = python.replace(codegen_backend=CodeGenBackend.X86_64)
+    functions = [retort.get_loader(list[datetime]) for retort in (python, native)]
+    data = ["2024-01-01T00:00:00", text]
+    try:
+        expected = functions[0](data)
+    except Exception as error:
+        raises_exc(error, lambda: functions[1](data))
+    else:
+        assert functions[1](data) == expected
 
 
+def test_enum_hash_mutation_after_warming_keeps_dictionary_semantics():
+    class State(str, Enum):
+        OPEN = "open"
+        CLOSED = "closed"
+
+    python = Retort()
+    native = python.replace(codegen_backend=CodeGenBackend.X86_64)
+    functions = [retort.get_dumper(list[State]) for retort in (python, native)]
+    data = [State.OPEN, State.CLOSED]
+    for _ in range(30):
+        assert functions[1](data) == functions[0](data)
+
+    def broken_hash(value):
+        raise ValueError("hash changed")
+
+    State.__hash__ = broken_hash
+    with pytest.raises(Exception, match=r".+") as expected:
+        functions[0](data)
+    raises_exc(expected.value, lambda: functions[1](data))
 
 
+def test_plain_enum_renaming_preserves_hash_lookup():
+    class State(Enum):
+        OPEN = "open"
+        CLOSED = "closed"
+
+    python = Retort()
+    native = python.replace(codegen_backend=CodeGenBackend.X86_64)
+    functions = [retort.get_dumper(list[State]) for retort in (python, native)]
+    data = [State.OPEN, State.CLOSED]
+    for _ in range(30):
+        assert functions[1](data) == functions[0](data)
+    State.OPEN._name_ = "RENAMED"
+    try:
+        expected = functions[0](data)
+    except Exception as error:
+        raises_exc(error, lambda: functions[1](data))
+    else:
+        # A changed hash may still reach the same bucket and identity match.
+        assert functions[1](data) == expected
 
 
+def test_enum_member_class_changes_keep_lookup_semantics():
+    class State(str, Enum):
+        OPEN = "open"
+
+    class Changed(str):  # noqa: SLOT000  # Match the enum member's dictionary layout.
+        def __hash__(self):
+            raise ValueError("changed member class")
+
+    python = Retort()
+    native = python.replace(codegen_backend=CodeGenBackend.X86_64)
+    functions = [retort.get_dumper(list[State]) for retort in (python, native)]
+    data = [State.OPEN]
+    for _ in range(30):
+        assert functions[1](data) == ["open"]
+    State.OPEN.__class__ = Changed
+    with pytest.raises(Exception, match=r".+") as expected:
+        functions[0](data)
+    raises_exc(expected.value, lambda: functions[1](data))
 
 
 @pytest.mark.parametrize("debug_trail", list(DebugTrail))
@@ -168,6 +275,23 @@ def test_fused_default_filters_release_every_row_reference(debug_trail):
     assert [sys.getrefcount(value) for value in values] == counts
 
 
+@pytest.mark.parametrize(["attribute", "value"], [("platform", "win32"), ("maxsize", 2**31 - 1)])
+def test_python_enum_provider_does_not_inspect_unsupported_object_layouts(monkeypatch, attribute, value):
+    if sys.version_info[:2] not in {(3, 13), (3, 14), (3, 15)}:
+        pytest.skip("Private enum storage is enabled on 3.13-3.15")
+    from adaptix._internal.code_tools import native_access
+
+    class State(str, Enum):
+        OPEN = "open"
+
+    def forbidden(*args):
+        pytest.fail("Python backend inspected a private object layout")
+
+    monkeypatch.setattr(native_access, "LOOKUP", forbidden)
+    monkeypatch.setattr(sys, attribute, value)
+    retort = Retort()
+    assert retort.load("open", State) is State.OPEN
+    assert retort.dump(State.OPEN, State) == "open"
 
 
 @pytest.mark.parametrize("count", [4, 32])
