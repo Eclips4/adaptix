@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import BuiltinFunctionType
+from typing import Any
 
 from adaptix._internal.code_tools.native_callable import NativeCode
 from adaptix._internal.code_tools.x86_64_compiler import X86Compiler, check_native_platform
@@ -10,14 +11,36 @@ from adaptix._internal.morphing.concrete_provider import none_loader
 from adaptix._internal.morphing.model.basic_gen import CodeGenHook
 from adaptix._internal.morphing.native.codegen import NativeCodeGenerator, publish
 from adaptix._internal.morphing.native.plan import (
+    DictPlan,
+    IterablePlan,
     ModelDumperPlan,
     ModelLoaderPlan,
     NativePlan,
     ScalarPlan,
+    TuplePlan,
+    UnionPlan,
 )
+from adaptix._internal.morphing.native.x86_64.dict import build_dict_program
+from adaptix._internal.morphing.native.x86_64.iterable import build_list_program
 from adaptix._internal.morphing.native.x86_64.model import NativeModelDumperGen, NativeModelLoaderGen
 from adaptix._internal.morphing.native.x86_64.scalar import get_program
+from adaptix._internal.morphing.native.x86_64.set import build_set_program
+from adaptix._internal.morphing.native.x86_64.tuple import build_tuple_program
+from adaptix._internal.morphing.native.x86_64.union import build_union_program
 from adaptix._internal.retort.operating_retort import FuncWrapper
+
+BUILDERS: dict[type, Callable[..., Any]] = {
+    DictPlan: build_dict_program,
+    TuplePlan: build_tuple_program,
+    UnionPlan: build_union_program,
+}
+
+
+def build_container_program(plan: IterablePlan | DictPlan | TuplePlan | UnionPlan, compiler: X86Compiler):
+    if isinstance(plan, IterablePlan):
+        builder = build_set_program if plan.origin in (set, frozenset) else build_list_program
+        return builder(plan, compiler)
+    return BUILDERS[type(plan)](plan, compiler)
 
 
 @dataclass(frozen=True)
@@ -52,7 +75,10 @@ class X86CodeGenerator(NativeCodeGenerator):
             if not compiler.has_validated_object_header:
                 return mapper
         else:
-            return plan.fallback
+            compiler = self.make_compiler(plan.name)
+            program = build_container_program(plan, compiler)
+            if program is None:
+                return plan.fallback
         return publish(compiler.finish(program.emit(compiler), program=program), hook, CodeGenBackend.X86_64)
 
 

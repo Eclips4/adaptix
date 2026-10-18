@@ -9,11 +9,18 @@ def get_program(function):
     description = get_description(function)
     if description is None or hasattr(description, "emit"):
         return description
-    if isinstance(description, descriptions.ScalarProgram):
-        return ScalarProgram(**vars(description))
-    if isinstance(description, descriptions.DecimalProgram):
-        return DecimalProgram(**vars(description))
-    return None
+    from adaptix._internal.morphing.native.x86_64.optional import OptionalProgram  # noqa: PLC0415
+    from adaptix._internal.morphing.native.x86_64.union import LiteralProgram, UnionDumperProgram  # noqa: PLC0415
+
+    emitters = {
+        descriptions.ScalarProgram: ScalarProgram,
+        descriptions.DecimalProgram: DecimalProgram,
+        descriptions.OptionalProgram: OptionalProgram,
+        descriptions.LiteralProgram: LiteralProgram,
+        descriptions.UnionDumperProgram: UnionDumperProgram,
+    }
+    emitter = emitters.get(type(description))
+    return emitter(**vars(description)) if emitter is not None else None
 
 
 
@@ -94,4 +101,34 @@ class ScalarProgram(descriptions.ScalarProgram):
 
 
 def convert_integer_float(c, function):
-    return c.guarded_c_call("PyNumber_Float", (c.data,), retry_scalar, c.constant(function), c.data)
+    from adaptix._internal.morphing.native.x86_64.union import integer_layout_supported  # noqa: PLC0415
+
+    if not integer_layout_supported():
+        return c.guarded_c_call("PyNumber_Float", (c.data,), retry_scalar, c.constant(function), c.data)
+    wide, zero, positive, ready, done = (
+        c.label(prefix) for prefix in ("wide_integer_float", "zero_integer_float", "positive_integer_float",
+                                      "compact_integer_float", "integer_float_done")
+    )
+    result = c.slot(owned=True)
+    c.asm.load(0, c.data)
+    c.asm.emit(b"\x48\x8b\x48" + bytes([c.layout.long_tag]) + b"\x48\x83\xf9\x10", "check compact integer digit count")
+    c.asm.jump(wide, "ae")
+    c.asm.emit(b"\xf6\xc1\x01", "check zero integer tag")
+    c.asm.jump(zero, "nz")
+    c.asm.emit(b"\x8b\x40" + bytes([c.layout.long_digits]) + b"\xf6\xc1\x02", "load integer digit; check sign")
+    c.asm.jump(positive, "z")
+    c.asm.emit(b"\x48\xf7\xd8", "negate integer digit")
+    c.asm.label(positive)
+    c.asm.jump(ready)
+    c.asm.label(zero)
+    c.asm.emit(b"\x31\xc0", "zero integer magnitude")
+    c.asm.label(ready)
+    c.asm.emit(b"\xf2\x48\x0f\x2a\xc0", "convert compact integer to double in xmm0")
+    converted = c.guarded_c_call("PyFloat_FromDouble", (), retry_scalar, c.constant(function), c.data)
+    c.transfer(converted, result)
+    c.asm.jump(done)
+    c.asm.label(wide)
+    converted = c.guarded_c_call("PyNumber_Float", (c.data,), retry_scalar, c.constant(function), c.data)
+    c.transfer(converted, result)
+    c.asm.label(done)
+    return result

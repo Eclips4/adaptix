@@ -11,10 +11,16 @@ from threading import Barrier
 import pytest
 from tests_helpers import reference_counts
 
+from adaptix import CodeGenBackend, Retort
 from adaptix._internal.code_tools.native_callable import ExecutableMemory
 from adaptix._internal.code_tools.native_dictionary import DictionaryTemplate
 from adaptix._internal.code_tools.x86_64_assembler import Address, Immediate, Slot, X86Assembler
 from adaptix._internal.code_tools.x86_64_compiler import X86Compiler, check_native_platform
+from adaptix._internal.morphing.native.x86_64.iterable import (
+    append_tuple_item,
+    finish_tuple_output,
+    reserve_iterator_output,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -987,6 +993,49 @@ def test_list_to_tuple_transfer_preserves_ownership_and_shared_lists(shared):
     assert sys.getrefcount(value) == references
 
 
+@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("mode", ["inline", "direct", "limited", "budget"])
+def test_nested_native_loop_preserves_callee_saved_registers(monkeypatch, failure, mode):
+    if mode == "limited":
+        monkeypatch.setattr("adaptix._internal.code_tools.x86_64_compiler.MAX_INLINE_CODE_SIZE", 0)
+    inner = Retort(codegen_backend=CodeGenBackend.X86_64).get_loader(list[list[int]])
+    compiler = X86Compiler("native_preserved_loop_registers")
+    assert compiler.reserve_loop_registers()
+    seeds = (0xFEDCBA0987654321, 0x0123456789ABCDEF, 0x9988776655443322, 0x8899AABBCCDDEEFF)
+    for register, seed in zip((12, 13, 14, 15), seeds, strict=True):
+        compiler.asm.mov_imm(register, seed)
+    if mode != "direct":
+        result = compiler.inline_call(
+            inner, compiler.data, (lambda error: ["failed"]) if failure else None,
+            code_budget=0 if mode == "budget" else None,
+        )
+    else:
+        result = (
+            compiler.guarded_call(inner, (compiler.data,), lambda error: ["failed"])
+            if failure else compiler.call_native(inner, compiler.data, "error")
+        )
+    invalid, done = compiler.label("invalid_register"), compiler.label("registers_preserved")
+    for register, seed in zip((12, 13, 14, 15), seeds, strict=True):
+        compiler.asm.mov_imm(11, seed)
+        compiler.asm.emit(bytes([0x4D, 0x39, 0xD8 | (register & 7)]), "check preserved loop register")
+        compiler.asm.jump(invalid, "nz")
+    compiler.asm.jump(done)
+    compiler.asm.label(invalid)
+    message = ctypes.create_string_buffer(b"Native loop clobbered a callee-saved register")
+    compiler.constants.append(message)
+    compiler.call_c("PyErr_SetString", compiler.constant(AssertionError), Immediate(ctypes.addressof(message)),
+                    result="void")
+    compiler.asm.jump("error")
+    compiler.asm.label(done)
+    compiler.release_loop_registers()
+    function = compiler.finish(result).make_callable()
+    for _ in range(100):
+        if failure:
+            assert function([[1000], [2000, "invalid"]]) == ["failed"]
+            assert function(iter([[1000], [2000, "invalid"]])) == ["failed"]
+        else:
+            assert function([[1000], [2000, 3000]]) == [[1000], [2000, 3000]]
+            assert function(iter([[1000], [2000, 3000]])) == [[1000], [2000, 3000]]
 
 
 def test_reference_replacement_publishes_result_before_destructor_reentry():
@@ -1006,3 +1055,35 @@ def test_reference_replacement_publishes_result_before_destructor_reentry():
     assert destroyed == [["replacement"]] * 100
 
 
+@pytest.mark.parametrize("reserved", [0, 1, 2, 5])
+def test_private_tuple_builder_grows_shrinks_and_tracks_final_cycles(reserved):
+    references = []
+
+    class Value:
+        pass
+
+    def create():
+        gc.collect()
+        for candidate in gc.get_objects():
+            if type(candidate) is tuple:
+                list(candidate)
+        value = Value()
+        references.append(weakref.ref(value))
+        return value
+
+    compiler = X86Compiler("native_private_tuple_builder")
+    result, written = reserve_iterator_output(compiler, Immediate(reserved), direct_tuple=True)
+    for _ in range(3):
+        value = compiler.call(create)
+        append_tuple_item(compiler, result, value, written)
+    finish_tuple_output(compiler, result, written)
+    function = compiler.finish(result).make_callable()
+    for _ in range(10):
+        result = function(None)
+        assert len(result) == 3
+        assert gc.is_tracked(result)
+        for value in result:
+            value.cycle = result
+        del value, result
+        gc.collect()
+        assert all(reference() is None for reference in references)
